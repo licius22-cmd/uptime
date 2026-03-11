@@ -11,20 +11,27 @@ const app = express();
 const prisma = new PrismaClient();
 const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
 
-app.use(cors());
+app.use(cors({ origin: '*' }));
 app.use(express.json());
 
 // --- API ENDPOINTS ---
 
 app.post('/api/monitors', async (req, res) => {
-    const { url, interval, email } = req.body;
+    const { name, url, interval, email, alertThreshold, criticalThreshold } = req.body;
     if (!url || !interval || !email) {
         return res.status(400).json({ error: 'Missing required fields' });
     }
 
     try {
         const monitor = await prisma.monitor.create({
-            data: { url, interval: parseInt(interval), email }
+            data: {
+                name: name || 'Monitor',
+                url,
+                interval: parseInt(interval),
+                email,
+                alertThreshold: alertThreshold ? parseInt(alertThreshold) : 1000,
+                criticalThreshold: criticalThreshold ? parseInt(criticalThreshold) : 2000
+            }
         });
         res.json(monitor);
     } catch (error) {
@@ -53,6 +60,60 @@ app.delete('/api/monitors/:id', async (req, res) => {
     }
 });
 
+app.put('/api/monitors/:id', async (req, res) => {
+    const { id } = req.params;
+    const { name, url, interval, email, alertThreshold, criticalThreshold } = req.body;
+
+    try {
+        const monitor = await prisma.monitor.update({
+            where: { id },
+            data: {
+                name: name || 'Monitor',
+                url,
+                interval: parseInt(interval),
+                email,
+                alertThreshold: parseInt(alertThreshold),
+                criticalThreshold: parseInt(criticalThreshold)
+            }
+        });
+        res.json(monitor);
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.get('/api/monitors/:id/history', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { timeframe } = req.query; // '5m', '10m', '30m', '1h', '6h', '12h', '1d'
+
+        const now = new Date();
+        let thresholdDate = new Date(now.getTime() - 60 * 60 * 1000); // Default 1h
+
+        switch (timeframe) {
+            case '5m': thresholdDate = new Date(now.getTime() - 5 * 60 * 1000); break;
+            case '10m': thresholdDate = new Date(now.getTime() - 10 * 60 * 1000); break;
+            case '30m': thresholdDate = new Date(now.getTime() - 30 * 60 * 1000); break;
+            case '1h': thresholdDate = new Date(now.getTime() - 60 * 60 * 1000); break;
+            case '6h': thresholdDate = new Date(now.getTime() - 6 * 60 * 60 * 1000); break;
+            case '12h': thresholdDate = new Date(now.getTime() - 12 * 60 * 60 * 1000); break;
+            case '1d': thresholdDate = new Date(now.getTime() - 24 * 60 * 60 * 1000); break;
+        }
+
+        const history = await prisma.monitorHistory.findMany({
+            where: {
+                monitorId: id,
+                createdAt: { gte: thresholdDate }
+            },
+            orderBy: { createdAt: 'desc' },
+            take: 1500
+        });
+        res.json(history.reverse()); // return chronological order
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
 // --- CRON JOB ---
 
 // Run every minute
@@ -76,11 +137,21 @@ cron.schedule('* * * * *', async () => {
                 const startTime = Date.now();
 
                 try {
-                    const response = await axios.get(monitor.url, { timeout: 10000 });
-                    isUp = response.status >= 200 && response.status < 400;
+                    const response = await axios.get(monitor.url, {
+                        timeout: 10000,
+                        headers: {
+                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                        },
+                        validateStatus: function (status) {
+                            return status >= 200 && status < 500; // Resolve for < 500
+                        }
+                    });
+                    // Cloudflare and strict WAFs return 401/403 for automated bots. 
+                    // To us, this means the server is UP.
+                    isUp = (response.status >= 200 && response.status < 400) || response.status === 401 || response.status === 403;
                     responseTime = Date.now() - startTime;
 
-                    if (responseTime > 2000) {
+                    if (responseTime > (monitor.criticalThreshold || 2000)) {
                         isUp = false; // Consider slow as down for alerting purposes in this simple SaaS
                     }
                 } catch (error) {
@@ -88,6 +159,15 @@ cron.schedule('* * * * *', async () => {
                 }
 
                 const newStatus = isUp ? 'up' : 'down';
+
+                // Log History
+                await prisma.monitorHistory.create({
+                    data: {
+                        monitorId: monitor.id,
+                        responseTime: responseTime,
+                        status: newStatus
+                    }
+                });
 
                 // If status changed to down, or we just detected down, send email
                 if (newStatus === 'down' && monitor.status !== 'down') {
@@ -115,7 +195,7 @@ cron.schedule('* * * * *', async () => {
                                         </tr>
                                         <tr>
                                             <td style="padding: 10px; border-bottom: 1px solid #f3f4f6; color: #6b7280;"><strong>Tempo:</strong></td>
-                                            <td style="padding: 10px; border-bottom: 1px solid #f3f4f6; color: ${responseTime > 2000 ? '#d97706' : '#dc2626'}; font-weight: bold;">${responseTime} milissegundos</td>
+                                            <td style="padding: 10px; border-bottom: 1px solid #f3f4f6; color: ${responseTime > (monitor.criticalThreshold || 2000) ? '#dc2626' : (responseTime > (monitor.alertThreshold || 1000) ? '#d97706' : '#059669')}; font-weight: bold;">${responseTime} milissegundos</td>
                                         </tr>
                                         <tr>
                                             <td style="padding: 10px; color: #6b7280;"><strong>Data / Hora:</strong></td>
@@ -129,13 +209,17 @@ cron.schedule('* * * * *', async () => {
                             </div>
                             `;
 
-                            await resend.emails.send({
-                                from: 'onboarding@resend.dev', // Default testing domain for resend
-                                to: monitor.email,
-                                subject: `Alerta: ${monitor.url} está OFFLINE ou LENTO!`,
-                                html: htmlTemplate
-                            });
-                            console.log(`Alert email sent to ${monitor.email} for ${monitor.url} at ${dateGmt3}`);
+                            const emailsToSend = monitor.email ? monitor.email.split(',').map(e => e.trim()).filter(e => e) : [];
+
+                            if (emailsToSend.length > 0) {
+                                await resend.emails.send({
+                                    from: 'onboarding@resend.dev', // Default testing domain for resend
+                                    to: emailsToSend,
+                                    subject: `Alerta: ${monitor.url} está OFFLINE ou LENTO!`,
+                                    html: htmlTemplate
+                                });
+                                console.log(`Alert email sent to ${emailsToSend.join(', ')} for ${monitor.url} at ${dateGmt3}`);
+                            }
                         } catch (err) {
                             console.error('Failed to send email:', err);
                         }
